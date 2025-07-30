@@ -22,6 +22,10 @@ public:
         this->declare_parameter("global_frame", "map");
         this->declare_parameter("base_frame", "base_footprint");
         
+        // 狭い通路制御パラメータ
+        this->declare_parameter("min_passage_width", 0.15);
+        this->declare_parameter("enable_narrow_passage_mode", true);
+        
         // TF2関連初期化
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
@@ -50,9 +54,12 @@ private:
             // A*経路計画器を初期化
             tvvf_vo_c::Position origin(msg->info.origin.position.x, msg->info.origin.position.y);
             double wall_clearance = this->get_parameter("wall_clearance_distance").as_double();
+            double min_passage_width = this->get_parameter("min_passage_width").as_double();
+            bool enable_narrow_passage_mode = this->get_parameter("enable_narrow_passage_mode").as_bool();
             
             path_planner_ = std::make_unique<tvvf_vo_c::AStarPathPlanner>(
-                *msg, msg->info.resolution, origin, wall_clearance);
+                *msg, msg->info.resolution, origin, wall_clearance,
+                min_passage_width, enable_narrow_passage_mode);
             
             RCLCPP_INFO(this->get_logger(), "Map received: %dx%d, resolution: %.3f m/cell",
                        msg->info.width, msg->info.height, msg->info.resolution);

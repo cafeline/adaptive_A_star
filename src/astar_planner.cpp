@@ -3,15 +3,21 @@
 #include <algorithm>
 #include <iostream>
 #include <unordered_set>
+#include <queue>
+#include <limits>
 
 namespace tvvf_vo_c {
 
 AStarPathPlanner::AStarPathPlanner(const nav_msgs::msg::OccupancyGrid& grid,
                                    double resolution, const Position& origin,
-                                   double wall_clearance_distance)
+                                   double wall_clearance_distance,
+                                   double min_passage_width,
+                                   bool enable_narrow_passage_mode)
     : width_(grid.info.width), height_(grid.info.height), 
       resolution_(resolution), origin_(origin),
-      wall_clearance_distance_(wall_clearance_distance) {
+      wall_clearance_distance_(wall_clearance_distance),
+      min_passage_width_(min_passage_width),
+      enable_narrow_passage_mode_(enable_narrow_passage_mode) {
     
     // 占有格子データを2D配列に変換（Python版と同じ形式）
     grid_.resize(height_, std::vector<int>(width_));
@@ -35,94 +41,28 @@ std::optional<Path> AStarPathPlanner::plan_path(const Position& start_pos, const
     auto start_grid = world_to_grid(start_pos);
     auto goal_grid = world_to_grid(goal_pos);
     
-    
-    // 開始・終了位置の有効性チェック
-    if (!is_valid_position(start_grid) || !is_valid_position(goal_grid)) {
+    // 基本的な有効性チェック
+    if (start_grid.first < 0 || start_grid.first >= width_ || 
+        start_grid.second < 0 || start_grid.second >= height_ ||
+        goal_grid.first < 0 || goal_grid.first >= width_ || 
+        goal_grid.second < 0 || goal_grid.second >= height_) {
         return std::nullopt;
     }
     
-    // A*アルゴリズム - Python版と完全に同じ実装
-    std::vector<std::shared_ptr<AStarNode>> open_set;  // heapqの代わりにvectorを使用
-    std::unordered_set<std::pair<int, int>, PairHash> closed_set;
-    std::unordered_map<std::pair<int, int>, std::shared_ptr<AStarNode>, PairHash> open_dict;
+    // 動的制約選択方式：各位置の通路幅に応じて適切な制約を動的に選択
+    std::cout << "Starting path planning with dynamic clearance selection" << std::endl;
+    std::cout << "Wall clearance distance: " << wall_clearance_distance_ << "m" << std::endl;
+    std::cout << "Min passage width: " << min_passage_width_ << "m" << std::endl;
     
-    // 開始ノード
-    auto start_node = std::make_shared<AStarNode>(
-        start_grid, 0.0, heuristic(start_grid, goal_grid)
-    );
-    open_set.push_back(start_node);
-    std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-        return *a > *b;  // 最小ヒープのため>演算子を使用
-    });
-    open_dict[start_grid] = start_node;
+    // 動的制約でA*を実行
+    auto result = plan_path_with_dynamic_clearance(start_grid, goal_grid);
     
-    while (!open_set.empty()) {
-        // 最小コストノードを取得（heappopと同じ動作）
-        std::pop_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-            return *a > *b;
-        });
-        auto current_node = open_set.back();
-        open_set.pop_back();
-        auto current_pos = current_node->position;
-        
-        // 辞書からも削除（Python版の実装に合わせる）
-        auto dict_it = open_dict.find(current_pos);
-        if (dict_it != open_dict.end()) {
-            open_dict.erase(dict_it);
-        }
-        
-        // ゴール到達チェック
-        if (current_pos == goal_grid) {
-            auto path = reconstruct_path(current_node);
-            // 経路スムージング
-            auto smoothed_path = smooth_path(path);
-            
-            return smoothed_path;
-        }
-        
-        // クローズドセットに追加
-        closed_set.insert(current_pos);
-        
-        // 隣接ノードを探索
-        for (const auto& neighbor_pos : get_neighbors(current_pos)) {
-            if (closed_set.find(neighbor_pos) != closed_set.end()) {
-                continue;
-            }
-            
-            // 移動コスト計算
-            double movement_cost = get_movement_cost(current_pos, neighbor_pos);
-            double tentative_g_cost = current_node->g_cost + movement_cost;
-            
-            // 既存ノードのチェック
-            auto open_it = open_dict.find(neighbor_pos);
-            if (open_it != open_dict.end()) {
-                auto neighbor_node = open_it->second;
-                if (tentative_g_cost < neighbor_node->g_cost) {
-                    // より良いパスを発見
-                    neighbor_node->g_cost = tentative_g_cost;
-                    neighbor_node->f_cost = tentative_g_cost + neighbor_node->h_cost;
-                    neighbor_node->parent = current_node;
-                    // Python版と同じ：ヒープを再構築
-                    std::make_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-                        return *a > *b;
-                    });
-                }
-            } else {
-                // 新しいノードを作成
-                double h_cost = heuristic(neighbor_pos, goal_grid);
-                auto neighbor_node = std::make_shared<AStarNode>(
-                    neighbor_pos, tentative_g_cost, h_cost, current_node
-                );
-                open_set.push_back(neighbor_node);
-                std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-                    return *a > *b;
-                });
-                open_dict[neighbor_pos] = neighbor_node;
-            }
-        }
+    if (result.has_value()) {
+        std::cout << "Path found with dynamic clearance selection" << std::endl;
+        return result;
     }
     
-    // 経路が見つからない
+    std::cout << "Path planning failed" << std::endl;
     return std::nullopt;
 }
 
@@ -359,6 +299,370 @@ bool AStarPathPlanner::has_line_of_sight(const Position& start, const Position& 
     }
     
     return true;  // 直線経路に障害物なし
+}
+
+// 新しいシンプルなメソッドの実装
+
+bool AStarPathPlanner::is_valid_position(const std::pair<int, int>& grid_pos, 
+                                        const std::vector<std::vector<int>>& inflated_grid) const {
+    int x = grid_pos.first;
+    int y = grid_pos.second;
+    
+    if (x < 0 || x >= width_ || y < 0 || y >= height_) {
+        return false;
+    }
+    
+    // 指定された膨張マップで占有状態をチェック
+    int cell_value = inflated_grid[y][x];
+    return cell_value >= 0 && cell_value < OCCUPIED_THRESHOLD;
+}
+
+std::vector<std::pair<int, int>> AStarPathPlanner::get_neighbors(const std::pair<int, int>& position, 
+                                                                const std::vector<std::vector<int>>& inflated_grid) const {
+    int x = position.first;
+    int y = position.second;
+    std::vector<std::pair<int, int>> neighbors;
+    
+    // 8方向の移動（対角線も含む）
+    static const std::vector<std::pair<int, int>> directions = {
+        {-1, -1}, {-1, 0}, {-1, 1},
+        {0, -1},           {0, 1},
+        {1, -1},  {1, 0},  {1, 1}
+    };
+    
+    for (const auto& dir : directions) {
+        int new_x = x + dir.first;
+        int new_y = y + dir.second;
+        std::pair<int, int> new_pos = {new_x, new_y};
+        
+        if (is_valid_position(new_pos, inflated_grid)) {
+            neighbors.push_back(new_pos);
+        }
+    }
+    
+    return neighbors;
+}
+
+void AStarPathPlanner::create_custom_inflated_grid(double clearance_distance) {
+    custom_inflated_grid_ = grid_;  // コピー作成
+    
+    // 膨張半径をグリッドセルで計算
+    int inflation_cells = static_cast<int>(clearance_distance / resolution_) + 1;
+    
+    for (int y = 0; y < height_; ++y) {
+        for (int x = 0; x < width_; ++x) {
+            if (grid_[y][x] >= OCCUPIED_THRESHOLD || grid_[y][x] == -1) {
+                // 占有セルの周囲を膨張
+                for (int dy = -inflation_cells; dy <= inflation_cells; ++dy) {
+                    for (int dx = -inflation_cells; dx <= inflation_cells; ++dx) {
+                        int nx = x + dx;
+                        int ny = y + dy;
+                        
+                        if (nx >= 0 && nx < width_ && ny >= 0 && ny < height_) {
+                            double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
+                            if (distance <= clearance_distance) {
+                                custom_inflated_grid_[ny][nx] = OCCUPIED_THRESHOLD;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+double AStarPathPlanner::calculate_passage_width(const std::pair<int, int>& grid_pos) const {
+    int x = grid_pos.first;
+    int y = grid_pos.second;
+    
+    if (x < 0 || x >= width_ || y < 0 || y >= height_) {
+        return 0.0;
+    }
+    
+    double min_distance_to_wall = std::numeric_limits<double>::max();
+    
+    // 周囲の占有セルまでの最短距離を計算（簡易版）
+    for (int dy = -50; dy <= 50; ++dy) {  // 適度な範囲で探索
+        for (int dx = -50; dx <= 50; ++dx) {
+            int nx = x + dx;
+            int ny = y + dy;
+            
+            if (nx >= 0 && nx < width_ && ny >= 0 && ny < height_) {
+                if (grid_[ny][nx] >= OCCUPIED_THRESHOLD || grid_[ny][nx] == -1) {
+                    double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
+                    min_distance_to_wall = std::min(min_distance_to_wall, distance);
+                }
+            }
+        }
+    }
+    
+    return min_distance_to_wall * 2.0;  // 通路幅 = 壁までの最短距離 × 2
+}
+
+double AStarPathPlanner::calculate_distance_from_passage_center(const std::pair<int, int>& grid_pos) const {
+    int x = grid_pos.first;
+    int y = grid_pos.second;
+    
+    if (x < 0 || x >= width_ || y < 0 || y >= height_) {
+        return std::numeric_limits<double>::max();
+    }
+    
+    double min_distance_to_wall = std::numeric_limits<double>::max();
+    
+    // 周囲の占有セルまでの最短距離を計算
+    for (int dy = -50; dy <= 50; ++dy) {
+        for (int dx = -50; dx <= 50; ++dx) {
+            int nx = x + dx;
+            int ny = y + dy;
+            
+            if (nx >= 0 && nx < width_ && ny >= 0 && ny < height_) {
+                if (grid_[ny][nx] >= OCCUPIED_THRESHOLD || grid_[ny][nx] == -1) {
+                    double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
+                    min_distance_to_wall = std::min(min_distance_to_wall, distance);
+                }
+            }
+        }
+    }
+    
+    // 通路中央からの距離 = 壁までの最短距離が最大になる位置が中央
+    // 値が大きいほど中央に近いので、コスト用に反転
+    return 1.0 / (min_distance_to_wall + 1e-6);  // 中央に近いほど小さいコスト
+}
+
+std::optional<Path> AStarPathPlanner::plan_path_with_clearance(const std::pair<int, int>& start_grid,
+                                                             const std::pair<int, int>& goal_grid,
+                                                             double clearance_distance,
+                                                             const std::vector<std::vector<int>>& inflated_grid) {
+    // A*アルゴリズム実装
+    std::vector<std::shared_ptr<AStarNode>> open_set;
+    std::unordered_set<std::pair<int, int>, PairHash> closed_set;
+    std::unordered_map<std::pair<int, int>, std::shared_ptr<AStarNode>, PairHash> open_dict;
+    
+    // 開始ノード
+    auto start_node = std::make_shared<AStarNode>(
+        start_grid, 0.0, heuristic(start_grid, goal_grid)
+    );
+    open_set.push_back(start_node);
+    std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+        return *a > *b;  // 最小ヒープ
+    });
+    open_dict[start_grid] = start_node;
+    
+    while (!open_set.empty()) {
+        // 最小コストノードを取得
+        std::pop_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+            return *a > *b;
+        });
+        auto current_node = open_set.back();
+        open_set.pop_back();
+        auto current_pos = current_node->position;
+        
+        // 辞書からも削除
+        auto dict_it = open_dict.find(current_pos);
+        if (dict_it != open_dict.end()) {
+            open_dict.erase(dict_it);
+        }
+        
+        // ゴール到達チェック
+        if (current_pos == goal_grid) {
+            auto path = reconstruct_path(current_node);
+            return smooth_path(path);
+        }
+        
+        // クローズドセットに追加
+        closed_set.insert(current_pos);
+        
+        // 隣接ノードを探索
+        for (const auto& neighbor_pos : get_neighbors(current_pos, inflated_grid)) {
+            if (closed_set.find(neighbor_pos) != closed_set.end()) {
+                continue;
+            }
+            
+            // 移動コスト計算
+            double movement_cost = get_movement_cost(current_pos, neighbor_pos);
+            double tentative_g_cost = current_node->g_cost + movement_cost;
+            
+            // 既存ノードのチェック
+            auto open_it = open_dict.find(neighbor_pos);
+            if (open_it != open_dict.end()) {
+                auto neighbor_node = open_it->second;
+                if (tentative_g_cost < neighbor_node->g_cost) {
+                    // より良いパスを発見
+                    neighbor_node->g_cost = tentative_g_cost;
+                    neighbor_node->f_cost = tentative_g_cost + neighbor_node->h_cost;
+                    neighbor_node->parent = current_node;
+                    // ヒープを再構築
+                    std::make_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+                        return *a > *b;
+                    });
+                }
+            } else {
+                // 新しいノードを作成
+                double h_cost = heuristic(neighbor_pos, goal_grid);
+                auto neighbor_node = std::make_shared<AStarNode>(
+                    neighbor_pos, tentative_g_cost, h_cost, current_node
+                );
+                open_set.push_back(neighbor_node);
+                std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+                    return *a > *b;
+                });
+                open_dict[neighbor_pos] = neighbor_node;
+            }
+        }
+    }
+    
+    // 経路が見つからない
+    return std::nullopt;
+}
+
+std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_clearance(const std::pair<int, int>& start_grid,
+                                                                      const std::pair<int, int>& goal_grid) {
+    // A*アルゴリズム実装（動的制約版）
+    std::vector<std::shared_ptr<AStarNode>> open_set;
+    std::unordered_set<std::pair<int, int>, PairHash> closed_set;
+    std::unordered_map<std::pair<int, int>, std::shared_ptr<AStarNode>, PairHash> open_dict;
+    
+    // 開始ノード
+    auto start_node = std::make_shared<AStarNode>(
+        start_grid, 0.0, heuristic(start_grid, goal_grid)
+    );
+    open_set.push_back(start_node);
+    std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+        return *a > *b;  // 最小ヒープ
+    });
+    open_dict[start_grid] = start_node;
+    
+    while (!open_set.empty()) {
+        // 最小コストノードを取得
+        std::pop_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+            return *a > *b;
+        });
+        auto current_node = open_set.back();
+        open_set.pop_back();
+        auto current_pos = current_node->position;
+        
+        // 辞書からも削除
+        auto dict_it = open_dict.find(current_pos);
+        if (dict_it != open_dict.end()) {
+            open_dict.erase(dict_it);
+        }
+        
+        // ゴール到達チェック
+        if (current_pos == goal_grid) {
+            auto path = reconstruct_path(current_node);
+            return smooth_path(path);
+        }
+        
+        // クローズドセットに追加
+        closed_set.insert(current_pos);
+        
+        // 隣接ノードを探索（動的制約使用）
+        for (const auto& neighbor_pos : get_neighbors_dynamic(current_pos)) {
+            if (closed_set.find(neighbor_pos) != closed_set.end()) {
+                continue;
+            }
+            
+            // 移動コスト計算
+            double movement_cost = get_movement_cost(current_pos, neighbor_pos);
+            
+            // 狭い通路では中央維持コストを追加
+            double passage_width = calculate_passage_width(neighbor_pos);
+            double center_cost = 0.0;
+            
+            if (passage_width < wall_clearance_distance_ * 2.0 && passage_width >= min_passage_width_) {
+                // 狭い通路の場合、中央からの距離をコストに加算
+                // 通路が狭いほど中央維持の重要度を上げる
+                double narrowness_factor = (wall_clearance_distance_ * 2.0 - passage_width) / (wall_clearance_distance_ * 2.0);
+                center_cost = calculate_distance_from_passage_center(neighbor_pos) * narrowness_factor * 1.0;  // 重み調整
+            }
+            
+            double tentative_g_cost = current_node->g_cost + movement_cost + center_cost;
+            
+            // 既存ノードのチェック
+            auto open_it = open_dict.find(neighbor_pos);
+            if (open_it != open_dict.end()) {
+                auto neighbor_node = open_it->second;
+                if (tentative_g_cost < neighbor_node->g_cost) {
+                    // より良いパスを発見
+                    neighbor_node->g_cost = tentative_g_cost;
+                    neighbor_node->f_cost = tentative_g_cost + neighbor_node->h_cost;
+                    neighbor_node->parent = current_node;
+                    // ヒープを再構築
+                    std::make_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+                        return *a > *b;
+                    });
+                }
+            } else {
+                // 新しいノードを作成
+                double h_cost = heuristic(neighbor_pos, goal_grid);
+                auto neighbor_node = std::make_shared<AStarNode>(
+                    neighbor_pos, tentative_g_cost, h_cost, current_node
+                );
+                open_set.push_back(neighbor_node);
+                std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+                    return *a > *b;
+                });
+                open_dict[neighbor_pos] = neighbor_node;
+            }
+        }
+    }
+    
+    // 経路が見つからない
+    return std::nullopt;
+}
+
+bool AStarPathPlanner::is_valid_position_dynamic(const std::pair<int, int>& grid_pos) const {
+    int x = grid_pos.first;
+    int y = grid_pos.second;
+    
+    if (x < 0 || x >= width_ || y < 0 || y >= height_) {
+        return false;
+    }
+    
+    // 元のグリッドで占有状態をチェック
+    if (grid_[y][x] >= OCCUPIED_THRESHOLD || grid_[y][x] == -1) {
+        return false;
+    }
+    
+    // 通路幅を計算
+    double passage_width = calculate_passage_width(grid_pos);
+    
+    // 通路幅に応じた制約を動的に適用
+    if (passage_width >= wall_clearance_distance_ * 2.0) {
+        // 広い通路：通常制約を使用
+        return inflated_grid_[y][x] < OCCUPIED_THRESHOLD;
+    } else if (passage_width >= min_passage_width_) {
+        // 狭い通路（但し最小幅以上）：縮小制約を使用
+        return true;  // 元のグリッドでOKなら通行可能
+    } else {
+        // 通路が狭すぎる
+        return false;
+    }
+}
+
+std::vector<std::pair<int, int>> AStarPathPlanner::get_neighbors_dynamic(const std::pair<int, int>& position) const {
+    int x = position.first;
+    int y = position.second;
+    std::vector<std::pair<int, int>> neighbors;
+    
+    // 8方向の移動（対角線も含む）
+    static const std::vector<std::pair<int, int>> directions = {
+        {-1, -1}, {-1, 0}, {-1, 1},
+        {0, -1},           {0, 1},
+        {1, -1},  {1, 0},  {1, 1}
+    };
+    
+    for (const auto& dir : directions) {
+        int new_x = x + dir.first;
+        int new_y = y + dir.second;
+        std::pair<int, int> new_pos = {new_x, new_y};
+        
+        if (is_valid_position_dynamic(new_pos)) {
+            neighbors.push_back(new_pos);
+        }
+    }
+    
+    return neighbors;
 }
 
 } // namespace tvvf_vo_c

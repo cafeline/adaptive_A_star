@@ -39,6 +39,18 @@ public:
      */
     std::optional<Path> plan_path(const Position& start_pos, const Position& goal_pos);
 
+    /**
+     * @brief 動的障害物を考慮したA*経路計画
+     * @param start_pos 開始位置（世界座標）
+     * @param goal_pos 目標位置（世界座標）
+     * @param dynamic_obstacles 動的障害物情報
+     * @return 計画された経路（失敗時はstd::nullopt）
+     */
+    std::optional<Path> plan_path_with_dynamic_obstacles(
+        const Position& start_pos, 
+        const Position& goal_pos,
+        const std::vector<std::pair<Position, double>>& dynamic_obstacles);
+
 
     /**
      * @brief 世界座標をグリッド座標に変換
@@ -116,6 +128,14 @@ private:
      * @param clearance_distance 膨張距離
      */
     void create_custom_inflated_grid(double clearance_distance);
+
+    /**
+     * @brief 動的障害物を考慮した一時的な占有グリッドを作成
+     * @param dynamic_obstacles 動的障害物情報（位置と半径のペア）
+     * @return 動的障害物を反映した占有グリッド
+     */
+    std::vector<std::vector<int>> create_temporary_grid_with_obstacles(
+        const std::vector<std::pair<Position, double>>& dynamic_obstacles);
 
     /**
      * @brief 指定された制約でA*経路計画を実行

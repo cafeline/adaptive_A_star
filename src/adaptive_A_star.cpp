@@ -11,6 +11,9 @@
 #include "adaptive_A_star/types.hpp"
 #include <optional>
 #include <memory>
+#include <chrono>
+#include <vector>
+#include <map>
 
 namespace adaptive_a_star {
 
@@ -26,13 +29,22 @@ public:
         this->declare_parameter("min_passage_width", 0.15);
         this->declare_parameter("enable_narrow_passage_mode", true);
         
+        // 動的再経路計画パラメータ
+        this->declare_parameter("obstacle_blocking_timeout", 3.0);  // 障害物が経路を阻害してから再計画までの時間 [s]
+        this->declare_parameter("path_obstacle_check_radius", 0.5); // 経路上の障害物チェック半径 [m]
+        this->declare_parameter("path_interpolation_resolution", 0.05); // 経路補間の最小間隔 [m]
+        this->declare_parameter("enable_dynamic_replanning", true); // 動的再経路計画の有効化
+        
         // TF2関連初期化
         tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
         tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
         
-        // パブリッシャー初期化
-        path_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("planned_path", 10);
-        path_viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("astar_path_viz", 10);
+        // パブリッシャー初期化（QoS設定を調整）
+        auto path_qos = rclcpp::QoS(10).reliable();
+        path_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("planned_path", path_qos);
+        
+        auto viz_qos = rclcpp::QoS(10).reliable().durability_volatile();
+        path_viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("astar_path_viz", viz_qos);
         
         // サブスクライバー初期化
         auto map_qos = rclcpp::QoS(1).reliable().transient_local();
@@ -42,6 +54,20 @@ public:
         // clicked_pointを受け取ってゴールとして設定
         clicked_point_sub_ = this->create_subscription<geometry_msgs::msg::PointStamped>(
             "clicked_point", 10, std::bind(&AdaptiveAStarNode::clicked_point_callback, this, std::placeholders::_1));
+            
+        // 障害物情報を受け取る
+        static_obstacles_sub_ = this->create_subscription<visualization_msgs::msg::MarkerArray>(
+            "static_obstacles", 10, std::bind(&AdaptiveAStarNode::static_obstacles_callback, this, std::placeholders::_1));
+        dynamic_obstacles_sub_ = this->create_subscription<visualization_msgs::msg::MarkerArray>(
+            "dynamic_obstacles", 10, std::bind(&AdaptiveAStarNode::dynamic_obstacles_callback, this, std::placeholders::_1));
+        
+        // 動的再経路計画の初期化
+        path_is_blocked_ = false;
+        
+        // 経路監視タイマー（1Hz）
+        path_monitor_timer_ = this->create_wall_timer(
+            std::chrono::seconds(1),
+            std::bind(&AdaptiveAStarNode::monitor_path_obstacles, this));
         
         RCLCPP_INFO(this->get_logger(), "Adaptive A* Node initialized");
     }
@@ -149,11 +175,20 @@ private:
         auto marker_array = visualization_msgs::msg::MarkerArray();
         std::string global_frame = this->get_parameter("global_frame").as_string();
         
+        // 古いマーカーを削除
+        auto delete_marker = visualization_msgs::msg::Marker();
+        delete_marker.header.frame_id = global_frame;
+        delete_marker.header.stamp = this->get_clock()->now();
+        delete_marker.id = 0;
+        delete_marker.action = visualization_msgs::msg::Marker::DELETE;
+        marker_array.markers.push_back(delete_marker);
+        
         // 線分マーカー（経路全体）
         auto line_marker = visualization_msgs::msg::Marker();
         line_marker.header.frame_id = global_frame;
         line_marker.header.stamp = this->get_clock()->now();
         line_marker.id = 0;
+        line_marker.ns = "astar_path";  // 名前空間を追加
         line_marker.type = visualization_msgs::msg::Marker::LINE_STRIP;
         line_marker.action = visualization_msgs::msg::Marker::ADD;
         
@@ -165,15 +200,32 @@ private:
             line_marker.points.push_back(point);
         }
         
-        line_marker.scale.x = 0.03;
-        line_marker.color.r = 0.0;
-        line_marker.color.g = 0.0;
-        line_marker.color.b = 1.0;
-        line_marker.color.a = 0.8;
+        line_marker.scale.x = 0.05;  // 少し太くして見やすく
+        
+        // 再計画された経路は赤色、通常経路は青色
+        static bool is_replanned_path = false;
+        if (path_is_blocked_) {
+            is_replanned_path = true;  // 再計画フラグを設定
+        }
+        
+        if (is_replanned_path) {
+            line_marker.color.r = 1.0;  // 赤色（再計画経路）
+            line_marker.color.g = 0.0;
+            line_marker.color.b = 0.0;
+        } else {
+            line_marker.color.r = 0.0;  // 青色（通常経路）
+            line_marker.color.g = 0.0;
+            line_marker.color.b = 1.0;
+        }
+        line_marker.color.a = 0.9;
         line_marker.lifetime = rclcpp::Duration::from_seconds(0);
         
         marker_array.markers.push_back(line_marker);
         path_viz_pub_->publish(marker_array);
+        
+        RCLCPP_INFO(this->get_logger(), "Published path visualization with %zu points, color: %s",
+                   line_marker.points.size(), 
+                   is_replanned_path ? "RED (replanned)" : "BLUE (normal)");
     }
     
     std::optional<tvvf_vo_c::Position> get_robot_position() {
@@ -197,12 +249,241 @@ private:
         }
     }
     
+    void static_obstacles_callback(const visualization_msgs::msg::MarkerArray::SharedPtr msg) {
+        static_obstacles_.clear();
+        for (const auto& marker : msg->markers) {
+            if (marker.action == visualization_msgs::msg::Marker::ADD) {
+                static_obstacles_.push_back(marker);
+            }
+        }
+    }
+    
+    void dynamic_obstacles_callback(const visualization_msgs::msg::MarkerArray::SharedPtr msg) {
+        dynamic_obstacles_.clear();
+        for (const auto& marker : msg->markers) {
+            if (marker.action == visualization_msgs::msg::Marker::ADD) {
+                dynamic_obstacles_.push_back(marker);
+            }
+        }
+    }
+    
+    void monitor_path_obstacles() {
+        if (!this->get_parameter("enable_dynamic_replanning").as_bool()) {
+            return;
+        }
+        
+        if (current_path_.empty() || !start_position_.has_value() || !goal_position_.has_value()) {
+            return;
+        }
+        
+        double check_radius = this->get_parameter("path_obstacle_check_radius").as_double();
+        double blocking_timeout = this->get_parameter("obstacle_blocking_timeout").as_double();
+        auto now = std::chrono::steady_clock::now();
+        
+        // 経路上の障害物をチェック
+        bool current_blocking = check_path_blocked(check_radius);
+        
+        if (current_blocking) {
+            if (!path_is_blocked_) {
+                // 新しい阻害開始
+                path_blocking_start_times_["current"] = now;
+                path_is_blocked_ = true;
+                RCLCPP_INFO(this->get_logger(), "Path blocked by obstacles, monitoring...");
+            } else {
+                // 阻害継続中
+                auto blocked_duration = std::chrono::duration_cast<std::chrono::duration<double>>(
+                    now - path_blocking_start_times_["current"]).count();
+                
+                if (blocked_duration >= blocking_timeout) {
+                    RCLCPP_WARN(this->get_logger(), 
+                        "Path blocked for %.1f seconds, triggering replanning", blocked_duration);
+                    replan_path_with_obstacles();
+                    path_blocking_start_times_.clear();
+                    path_is_blocked_ = false;
+                }
+            }
+        } else {
+            // 阻害解除
+            if (path_is_blocked_) {
+                RCLCPP_INFO(this->get_logger(), "Path no longer blocked");
+                path_is_blocked_ = false;
+                path_blocking_start_times_.clear();
+            }
+        }
+    }
+    
+    std::vector<tvvf_vo_c::Position> interpolate_path(const tvvf_vo_c::Path& path, double resolution) {
+        std::vector<tvvf_vo_c::Position> interpolated_points;
+        
+        if (path.empty()) {
+            return interpolated_points;
+        }
+        
+        // 最初の点を追加
+        interpolated_points.push_back(path.points[0].position);
+        
+        for (size_t i = 1; i < path.points.size(); ++i) {
+            const auto& prev_point = path.points[i-1].position;
+            const auto& curr_point = path.points[i].position;
+            
+            // 2点間の距離を計算
+            double dx = curr_point.x - prev_point.x;
+            double dy = curr_point.y - prev_point.y;
+            double segment_length = std::sqrt(dx * dx + dy * dy);
+            
+            // 補間が必要かチェック
+            if (segment_length > resolution) {
+                // 必要な分割数を計算
+                int num_divisions = static_cast<int>(std::ceil(segment_length / resolution));
+                
+                // 分割点を生成
+                for (int j = 1; j < num_divisions; ++j) {
+                    double t = static_cast<double>(j) / num_divisions;
+                    tvvf_vo_c::Position interpolated_point(
+                        prev_point.x + t * dx,
+                        prev_point.y + t * dy
+                    );
+                    interpolated_points.push_back(interpolated_point);
+                }
+            }
+            
+            // 現在の点を追加
+            interpolated_points.push_back(curr_point);
+        }
+        
+        return interpolated_points;
+    }
+
+    bool check_path_blocked(double check_radius) {
+        // 経路を補間して密な点列を生成
+        double interpolation_resolution = this->get_parameter("path_interpolation_resolution").as_double();
+        auto interpolated_points = interpolate_path(current_path_, interpolation_resolution);
+        
+        RCLCPP_DEBUG(this->get_logger(), "Checking %zu interpolated points (original: %zu points) with radius %.2fm",
+                    interpolated_points.size(), current_path_.points.size(), check_radius);
+        
+        for (const auto& path_point : interpolated_points) {
+            // 各経路点の周囲に障害物があるかチェック
+            for (const auto& static_obstacle : static_obstacles_) {
+                if (is_obstacle_near_point(path_point, static_obstacle, check_radius)) {
+                    RCLCPP_DEBUG(this->get_logger(), "Static obstacle detected at path point (%.2f, %.2f)",
+                                path_point.x, path_point.y);
+                    return true;
+                }
+            }
+            for (const auto& dynamic_obstacle : dynamic_obstacles_) {
+                if (is_obstacle_near_point(path_point, dynamic_obstacle, check_radius)) {
+                    RCLCPP_DEBUG(this->get_logger(), "Dynamic obstacle detected at path point (%.2f, %.2f)",
+                                path_point.x, path_point.y);
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+    
+    bool is_obstacle_near_point(const tvvf_vo_c::Position& point, 
+                               const visualization_msgs::msg::Marker& obstacle, 
+                               double radius) {
+        double dx = point.x - obstacle.pose.position.x;
+        double dy = point.y - obstacle.pose.position.y;
+        double distance = std::sqrt(dx * dx + dy * dy);
+        
+        // 障害物のサイズも考慮
+        double obstacle_radius = std::max(obstacle.scale.x, obstacle.scale.y) / 2.0;
+        return distance <= (radius + obstacle_radius);
+    }
+    
+    void replan_path_with_obstacles() {
+        if (!path_planner_ || !start_position_.has_value() || !goal_position_.has_value()) {
+            return;
+        }
+        
+        try {
+            RCLCPP_INFO(this->get_logger(), "Starting dynamic replanning with obstacle avoidance");
+            
+            // 現在のロボット位置を取得
+            auto robot_pos = get_robot_position();
+            if (robot_pos.has_value()) {
+                start_position_ = robot_pos.value();
+            }
+            
+            // 障害物情報を変換
+            std::vector<std::pair<tvvf_vo_c::Position, double>> obstacles;
+            
+            // 静的障害物を追加
+            for (const auto& static_obstacle : static_obstacles_) {
+                tvvf_vo_c::Position obs_pos(static_obstacle.pose.position.x, static_obstacle.pose.position.y);
+                // 四角形の障害物の場合、対角線の半分を半径として使用（安全のため少し大きく）
+                double obs_radius = std::sqrt(static_obstacle.scale.x * static_obstacle.scale.x + 
+                                            static_obstacle.scale.y * static_obstacle.scale.y) / 2.0 * 1.1;
+                obstacles.emplace_back(obs_pos, obs_radius);
+                
+                RCLCPP_INFO(this->get_logger(), "Static obstacle: pos(%.2f, %.2f), scale(%.2f, %.2f, %.2f), radius=%.2f",
+                           obs_pos.x, obs_pos.y, 
+                           static_obstacle.scale.x, static_obstacle.scale.y, static_obstacle.scale.z,
+                           obs_radius);
+            }
+            
+            // 動的障害物を追加  
+            for (const auto& dynamic_obstacle : dynamic_obstacles_) {
+                tvvf_vo_c::Position obs_pos(dynamic_obstacle.pose.position.x, dynamic_obstacle.pose.position.y);
+                // 四角形の障害物の場合、対角線の半分を半径として使用（安全のため少し大きく）
+                double obs_radius = std::sqrt(dynamic_obstacle.scale.x * dynamic_obstacle.scale.x + 
+                                            dynamic_obstacle.scale.y * dynamic_obstacle.scale.y) / 2.0 * 1.1;
+                obstacles.emplace_back(obs_pos, obs_radius);
+                
+                RCLCPP_INFO(this->get_logger(), "Dynamic obstacle: pos(%.2f, %.2f), scale(%.2f, %.2f, %.2f), radius=%.2f",
+                           obs_pos.x, obs_pos.y,
+                           dynamic_obstacle.scale.x, dynamic_obstacle.scale.y, dynamic_obstacle.scale.z,
+                           obs_radius);
+            }
+            
+            RCLCPP_INFO(this->get_logger(), "Replanning with %zu obstacles (%zu static, %zu dynamic)",
+                       obstacles.size(), static_obstacles_.size(), dynamic_obstacles_.size());
+            
+            // 障害物情報を考慮した再計画
+            auto start_time = std::chrono::high_resolution_clock::now();
+            auto planned_path = path_planner_->plan_path_with_dynamic_obstacles(
+                start_position_.value(), goal_position_.value(), obstacles);
+            auto end_time = std::chrono::high_resolution_clock::now();
+            
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
+            
+            if (planned_path.has_value()) {
+                current_path_ = planned_path.value();
+                RCLCPP_INFO(this->get_logger(), "Dynamic replanning successful - Points: %zu, Time: %ld ms",
+                           current_path_.size(), duration.count());
+                
+                // デバッグ: 新しい経路の最初と最後の点を表示
+                if (!current_path_.empty()) {
+                    const auto& first_point = current_path_.points.front();
+                    const auto& last_point = current_path_.points.back();
+                    RCLCPP_INFO(this->get_logger(), "New path: Start(%.2f, %.2f) -> Goal(%.2f, %.2f)",
+                              first_point.position.x, first_point.position.y,
+                              last_point.position.x, last_point.position.y);
+                }
+                           
+                publish_path();
+                publish_path_visualization();
+                
+                RCLCPP_INFO(this->get_logger(), "Path and visualization published");
+            } else {
+                RCLCPP_WARN(this->get_logger(), "Dynamic replanning failed after %ld ms", duration.count());
+            }
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "Dynamic replanning error: %s", e.what());
+        }
+    }
+    
     // メンバ変数
     rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr path_pub_;
     rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr path_viz_pub_;
     
     rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr map_sub_;
     rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr clicked_point_sub_;
+    rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr static_obstacles_sub_;
+    rclcpp::Subscription<visualization_msgs::msg::MarkerArray>::SharedPtr dynamic_obstacles_sub_;
     
     nav_msgs::msg::OccupancyGrid occupancy_grid_;
     std::unique_ptr<tvvf_vo_c::AStarPathPlanner> path_planner_;
@@ -214,6 +495,13 @@ private:
     std::optional<tvvf_vo_c::Position> start_position_;
     std::optional<tvvf_vo_c::Position> goal_position_;
     tvvf_vo_c::Path current_path_;
+    
+    // 動的再経路計画用
+    std::vector<visualization_msgs::msg::Marker> static_obstacles_;
+    std::vector<visualization_msgs::msg::Marker> dynamic_obstacles_;
+    std::map<std::string, std::chrono::steady_clock::time_point> path_blocking_start_times_;
+    bool path_is_blocked_;
+    rclcpp::TimerBase::SharedPtr path_monitor_timer_;
 };
 
 } // namespace adaptive_a_star

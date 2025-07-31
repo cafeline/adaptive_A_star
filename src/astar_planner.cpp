@@ -665,4 +665,174 @@ std::vector<std::pair<int, int>> AStarPathPlanner::get_neighbors_dynamic(const s
     return neighbors;
 }
 
+std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_obstacles(
+    const Position& start_pos, 
+    const Position& goal_pos,
+    const std::vector<std::pair<Position, double>>& dynamic_obstacles) {
+    
+    std::cout << "Planning path with " << dynamic_obstacles.size() << " dynamic obstacles" << std::endl;
+    
+    // 世界座標をグリッド座標に変換
+    auto start_grid = world_to_grid(start_pos);
+    auto goal_grid = world_to_grid(goal_pos);
+    
+    // 基本的な有効性チェック
+    if (start_grid.first < 0 || start_grid.first >= width_ || 
+        start_grid.second < 0 || start_grid.second >= height_ ||
+        goal_grid.first < 0 || goal_grid.first >= width_ || 
+        goal_grid.second < 0 || goal_grid.second >= height_) {
+        return std::nullopt;
+    }
+    
+    // 動的障害物を反映した一時的なグリッドを作成
+    auto temp_grid = create_temporary_grid_with_obstacles(dynamic_obstacles);
+    
+    // 一時的なグリッドに基づいて膨張マップを作成
+    std::vector<std::vector<int>> temp_inflated_grid = temp_grid;
+    
+    // 膨張処理
+    int inflation_cells = static_cast<int>(wall_clearance_distance_ / resolution_) + 1;
+    
+    std::vector<std::pair<int, int>> occupied_cells;
+    for (int y = 0; y < height_; ++y) {
+        for (int x = 0; x < width_; ++x) {
+            if (temp_grid[y][x] >= OCCUPIED_THRESHOLD) {
+                occupied_cells.emplace_back(x, y);
+            }
+        }
+    }
+    
+    for (const auto& cell : occupied_cells) {
+        int x = cell.first;
+        int y = cell.second;
+        
+        for (int dy = -inflation_cells; dy <= inflation_cells; ++dy) {
+            for (int dx = -inflation_cells; dx <= inflation_cells; ++dx) {
+                int new_x = x + dx;
+                int new_y = y + dy;
+                
+                if (new_x >= 0 && new_x < width_ && new_y >= 0 && new_y < height_) {
+                    double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
+                    if (distance <= wall_clearance_distance_) {
+                        if (temp_inflated_grid[new_y][new_x] < OCCUPIED_THRESHOLD) {
+                            temp_inflated_grid[new_y][new_x] = OCCUPIED_THRESHOLD;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    
+    std::cout << "Using temporary inflated grid for obstacle avoidance" << std::endl;
+    
+    // 開始位置とゴール位置が有効かチェック
+    if (temp_inflated_grid[start_grid.second][start_grid.first] >= OCCUPIED_THRESHOLD) {
+        std::cout << "ERROR: Start position is occupied in temporary grid!" << std::endl;
+        std::cout << "Start grid: (" << start_grid.first << ", " << start_grid.second 
+                  << "), value: " << temp_inflated_grid[start_grid.second][start_grid.first] << std::endl;
+    }
+    
+    if (temp_inflated_grid[goal_grid.second][goal_grid.first] >= OCCUPIED_THRESHOLD) {
+        std::cout << "ERROR: Goal position is occupied in temporary grid!" << std::endl;
+        std::cout << "Goal grid: (" << goal_grid.first << ", " << goal_grid.second 
+                  << "), value: " << temp_inflated_grid[goal_grid.second][goal_grid.first] << std::endl;
+    }
+    
+    // 動的制約でA*を実行
+    auto result = plan_path_with_clearance(start_grid, goal_grid, wall_clearance_distance_, temp_inflated_grid);
+    
+    if (!result.has_value()) {
+        std::cout << "A* failed with temporary grid. Attempting fallback with reduced clearance..." << std::endl;
+        
+        // フォールバック：狭い通路モードで再試行
+        if (enable_narrow_passage_mode_) {
+            // 縮小された膨張でもう一度試す
+            std::vector<std::vector<int>> reduced_inflated_grid = temp_grid;  // 膨張なしの基本グリッド
+            
+            // 最小限の膨張のみ適用
+            int min_inflation_cells = static_cast<int>(min_passage_width_ / resolution_) + 1;
+            
+            std::vector<std::pair<int, int>> temp_occupied_cells;
+            for (int y = 0; y < height_; ++y) {
+                for (int x = 0; x < width_; ++x) {
+                    if (temp_grid[y][x] >= OCCUPIED_THRESHOLD) {
+                        temp_occupied_cells.emplace_back(x, y);
+                    }
+                }
+            }
+            
+            for (const auto& cell : temp_occupied_cells) {
+                int x = cell.first;
+                int y = cell.second;
+                
+                for (int dy = -min_inflation_cells; dy <= min_inflation_cells; ++dy) {
+                    for (int dx = -min_inflation_cells; dx <= min_inflation_cells; ++dx) {
+                        int new_x = x + dx;
+                        int new_y = y + dy;
+                        
+                        if (new_x >= 0 && new_x < width_ && new_y >= 0 && new_y < height_) {
+                            double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
+                            if (distance <= min_passage_width_) {
+                                if (reduced_inflated_grid[new_y][new_x] < OCCUPIED_THRESHOLD) {
+                                    reduced_inflated_grid[new_y][new_x] = OCCUPIED_THRESHOLD;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            std::cout << "Trying fallback with reduced clearance: " << min_passage_width_ << "m" << std::endl;
+            result = plan_path_with_clearance(start_grid, goal_grid, min_passage_width_, reduced_inflated_grid);
+        }
+    }
+    
+    return result;
+}
+
+std::vector<std::vector<int>> AStarPathPlanner::create_temporary_grid_with_obstacles(
+    const std::vector<std::pair<Position, double>>& dynamic_obstacles) {
+    
+    // 元のグリッドをコピー
+    std::vector<std::vector<int>> temp_grid = grid_;
+    
+    // 動的障害物を追加
+    for (const auto& obstacle : dynamic_obstacles) {
+        const Position& obs_pos = obstacle.first;
+        double obs_radius = obstacle.second;
+        
+        // 障害物の世界座標をグリッド座標に変換
+        auto obstacle_grid = world_to_grid(obs_pos);
+        
+        // 障害物半径をグリッドセルで計算（安全マージンを追加、ただし最大制限あり）
+        int radius_cells = std::min(static_cast<int>(std::ceil(obs_radius / resolution_)) + 2, 
+                                   std::min(width_, height_) / 4);  // マップの1/4以下に制限
+        
+        std::cout << "Processing obstacle at grid (" << obstacle_grid.first << ", " << obstacle_grid.second 
+                  << "), world_radius=" << obs_radius << "m, radius_cells=" << radius_cells << std::endl;
+        
+        // 障害物周囲のセルを占有状態に設定（四角形として処理）
+        for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
+            for (int dx = -radius_cells; dx <= radius_cells; ++dx) {
+                int grid_x = obstacle_grid.first + dx;
+                int grid_y = obstacle_grid.second + dy;
+                
+                if (grid_x >= 0 && grid_x < width_ && grid_y >= 0 && grid_y < height_) {
+                    // 四角形の障害物の場合は距離チェックをスキップして矩形領域を占有
+                    double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
+                    if (distance <= obs_radius * 1.2) {  // 安全マージンを1.2倍
+                        temp_grid[grid_y][grid_x] = OCCUPIED_THRESHOLD;
+                    }
+                }
+            }
+        }
+        
+        std::cout << "Added obstacle at (" << obs_pos.x << ", " << obs_pos.y 
+                  << ") with radius " << obs_radius << ", affected " 
+                  << (2 * radius_cells + 1) * (2 * radius_cells + 1) << " grid cells" << std::endl;
+    }
+    
+    return temp_grid;
+}
+
 } // namespace tvvf_vo_c

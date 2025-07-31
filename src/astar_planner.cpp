@@ -1,7 +1,6 @@
 #include "adaptive_A_star/astar_planner.hpp"
 #include <cmath>
 #include <algorithm>
-#include <iostream>
 #include <unordered_set>
 #include <queue>
 #include <limits>
@@ -34,6 +33,9 @@ AStarPathPlanner::AStarPathPlanner(const nav_msgs::msg::OccupancyGrid& grid,
     
     // 壁からの距離を考慮した膨張マップを作成
     create_inflated_grid();
+    
+    // 距離場を事前計算
+    compute_distance_field();
 }
 
 std::optional<Path> AStarPathPlanner::plan_path(const Position& start_pos, const Position& goal_pos) {
@@ -49,20 +51,12 @@ std::optional<Path> AStarPathPlanner::plan_path(const Position& start_pos, const
         return std::nullopt;
     }
     
-    // 動的制約選択方式：各位置の通路幅に応じて適切な制約を動的に選択
-    std::cout << "Starting path planning with dynamic clearance selection" << std::endl;
-    std::cout << "Wall clearance distance: " << wall_clearance_distance_ << "m" << std::endl;
-    std::cout << "Min passage width: " << min_passage_width_ << "m" << std::endl;
-    
     // 動的制約でA*を実行
     auto result = plan_path_with_dynamic_clearance(start_grid, goal_grid);
     
     if (result.has_value()) {
-        std::cout << "Path found with dynamic clearance selection" << std::endl;
         return result;
     }
-    
-    std::cout << "Path planning failed" << std::endl;
     return std::nullopt;
 }
 
@@ -379,24 +373,8 @@ double AStarPathPlanner::calculate_passage_width(const std::pair<int, int>& grid
         return 0.0;
     }
     
-    double min_distance_to_wall = std::numeric_limits<double>::max();
-    
-    // 周囲の占有セルまでの最短距離を計算（簡易版）
-    for (int dy = -50; dy <= 50; ++dy) {  // 適度な範囲で探索
-        for (int dx = -50; dx <= 50; ++dx) {
-            int nx = x + dx;
-            int ny = y + dy;
-            
-            if (nx >= 0 && nx < width_ && ny >= 0 && ny < height_) {
-                if (grid_[ny][nx] >= OCCUPIED_THRESHOLD || grid_[ny][nx] == -1) {
-                    double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
-                    min_distance_to_wall = std::min(min_distance_to_wall, distance);
-                }
-            }
-        }
-    }
-    
-    return min_distance_to_wall * 2.0;  // 通路幅 = 壁までの最短距離 × 2
+    // 事前計算された距離場を使用
+    return distance_field_[y][x] * 2.0 * resolution_;
 }
 
 double AStarPathPlanner::calculate_distance_from_passage_center(const std::pair<int, int>& grid_pos) const {
@@ -407,34 +385,21 @@ double AStarPathPlanner::calculate_distance_from_passage_center(const std::pair<
         return std::numeric_limits<double>::max();
     }
     
-    double min_distance_to_wall = std::numeric_limits<double>::max();
-    
-    // 周囲の占有セルまでの最短距離を計算
-    for (int dy = -50; dy <= 50; ++dy) {
-        for (int dx = -50; dx <= 50; ++dx) {
-            int nx = x + dx;
-            int ny = y + dy;
-            
-            if (nx >= 0 && nx < width_ && ny >= 0 && ny < height_) {
-                if (grid_[ny][nx] >= OCCUPIED_THRESHOLD || grid_[ny][nx] == -1) {
-                    double distance = std::sqrt(dx * dx + dy * dy) * resolution_;
-                    min_distance_to_wall = std::min(min_distance_to_wall, distance);
-                }
-            }
-        }
-    }
-    
-    // 通路中央からの距離 = 壁までの最短距離が最大になる位置が中央
-    // 値が大きいほど中央に近いので、コスト用に反転
-    return 1.0 / (min_distance_to_wall + 1e-6);  // 中央に近いほど小さいコスト
+    // 事前計算された距離場を使用
+    double min_distance_to_wall = distance_field_[y][x] * resolution_;
+    return 1.0 / (min_distance_to_wall + 1e-6);
 }
 
 std::optional<Path> AStarPathPlanner::plan_path_with_clearance(const std::pair<int, int>& start_grid,
                                                              const std::pair<int, int>& goal_grid,
                                                              double clearance_distance,
                                                              const std::vector<std::vector<int>>& inflated_grid) {
-    // A*アルゴリズム実装
-    std::vector<std::shared_ptr<AStarNode>> open_set;
+    // A*アルゴリズム実装（優先度キューを使用）
+    std::priority_queue<std::shared_ptr<AStarNode>, std::vector<std::shared_ptr<AStarNode>>, 
+                        std::function<bool(const std::shared_ptr<AStarNode>&, const std::shared_ptr<AStarNode>&)>> open_set(
+                        [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+                            return a->f_cost > b->f_cost;
+                        });
     std::unordered_set<std::pair<int, int>, PairHash> closed_set;
     std::unordered_map<std::pair<int, int>, std::shared_ptr<AStarNode>, PairHash> open_dict;
     
@@ -442,19 +407,13 @@ std::optional<Path> AStarPathPlanner::plan_path_with_clearance(const std::pair<i
     auto start_node = std::make_shared<AStarNode>(
         start_grid, 0.0, heuristic(start_grid, goal_grid)
     );
-    open_set.push_back(start_node);
-    std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-        return *a > *b;  // 最小ヒープ
-    });
+    open_set.push(start_node);
     open_dict[start_grid] = start_node;
     
     while (!open_set.empty()) {
         // 最小コストノードを取得
-        std::pop_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-            return *a > *b;
-        });
-        auto current_node = open_set.back();
-        open_set.pop_back();
+        auto current_node = open_set.top();
+        open_set.pop();
         auto current_pos = current_node->position;
         
         // 辞書からも削除
@@ -487,14 +446,13 @@ std::optional<Path> AStarPathPlanner::plan_path_with_clearance(const std::pair<i
             if (open_it != open_dict.end()) {
                 auto neighbor_node = open_it->second;
                 if (tentative_g_cost < neighbor_node->g_cost) {
-                    // より良いパスを発見
-                    neighbor_node->g_cost = tentative_g_cost;
-                    neighbor_node->f_cost = tentative_g_cost + neighbor_node->h_cost;
-                    neighbor_node->parent = current_node;
-                    // ヒープを再構築
-                    std::make_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-                        return *a > *b;
-                    });
+                    // より良いパスを発見（既存ノードの更新はコストが高いため新規ノードで処理）
+                    double h_cost = heuristic(neighbor_pos, goal_grid);
+                    auto new_neighbor_node = std::make_shared<AStarNode>(
+                        neighbor_pos, tentative_g_cost, h_cost, current_node
+                    );
+                    open_set.push(new_neighbor_node);
+                    open_dict[neighbor_pos] = new_neighbor_node;
                 }
             } else {
                 // 新しいノードを作成
@@ -502,10 +460,7 @@ std::optional<Path> AStarPathPlanner::plan_path_with_clearance(const std::pair<i
                 auto neighbor_node = std::make_shared<AStarNode>(
                     neighbor_pos, tentative_g_cost, h_cost, current_node
                 );
-                open_set.push_back(neighbor_node);
-                std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-                    return *a > *b;
-                });
+                open_set.push(neighbor_node);
                 open_dict[neighbor_pos] = neighbor_node;
             }
         }
@@ -518,7 +473,11 @@ std::optional<Path> AStarPathPlanner::plan_path_with_clearance(const std::pair<i
 std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_clearance(const std::pair<int, int>& start_grid,
                                                                       const std::pair<int, int>& goal_grid) {
     // A*アルゴリズム実装（動的制約版）
-    std::vector<std::shared_ptr<AStarNode>> open_set;
+    std::priority_queue<std::shared_ptr<AStarNode>, std::vector<std::shared_ptr<AStarNode>>, 
+                        std::function<bool(const std::shared_ptr<AStarNode>&, const std::shared_ptr<AStarNode>&)>> open_set(
+                        [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
+                            return a->f_cost > b->f_cost;
+                        });
     std::unordered_set<std::pair<int, int>, PairHash> closed_set;
     std::unordered_map<std::pair<int, int>, std::shared_ptr<AStarNode>, PairHash> open_dict;
     
@@ -526,19 +485,13 @@ std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_clearance(const std
     auto start_node = std::make_shared<AStarNode>(
         start_grid, 0.0, heuristic(start_grid, goal_grid)
     );
-    open_set.push_back(start_node);
-    std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-        return *a > *b;  // 最小ヒープ
-    });
+    open_set.push(start_node);
     open_dict[start_grid] = start_node;
     
     while (!open_set.empty()) {
         // 最小コストノードを取得
-        std::pop_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-            return *a > *b;
-        });
-        auto current_node = open_set.back();
-        open_set.pop_back();
+        auto current_node = open_set.top();
+        open_set.pop();
         auto current_pos = current_node->position;
         
         // 辞書からも削除
@@ -583,14 +536,13 @@ std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_clearance(const std
             if (open_it != open_dict.end()) {
                 auto neighbor_node = open_it->second;
                 if (tentative_g_cost < neighbor_node->g_cost) {
-                    // より良いパスを発見
-                    neighbor_node->g_cost = tentative_g_cost;
-                    neighbor_node->f_cost = tentative_g_cost + neighbor_node->h_cost;
-                    neighbor_node->parent = current_node;
-                    // ヒープを再構築
-                    std::make_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-                        return *a > *b;
-                    });
+                    // より良いパスを発見（既存ノードの更新はコストが高いため新規ノードで処理）
+                    double h_cost = heuristic(neighbor_pos, goal_grid);
+                    auto new_neighbor_node = std::make_shared<AStarNode>(
+                        neighbor_pos, tentative_g_cost, h_cost, current_node
+                    );
+                    open_set.push(new_neighbor_node);
+                    open_dict[neighbor_pos] = new_neighbor_node;
                 }
             } else {
                 // 新しいノードを作成
@@ -598,10 +550,7 @@ std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_clearance(const std
                 auto neighbor_node = std::make_shared<AStarNode>(
                     neighbor_pos, tentative_g_cost, h_cost, current_node
                 );
-                open_set.push_back(neighbor_node);
-                std::push_heap(open_set.begin(), open_set.end(), [](const std::shared_ptr<AStarNode>& a, const std::shared_ptr<AStarNode>& b) {
-                    return *a > *b;
-                });
+                open_set.push(neighbor_node);
                 open_dict[neighbor_pos] = neighbor_node;
             }
         }
@@ -670,8 +619,6 @@ std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_obstacles(
     const Position& goal_pos,
     const std::vector<std::pair<Position, double>>& dynamic_obstacles) {
     
-    std::cout << "Planning path with " << dynamic_obstacles.size() << " dynamic obstacles" << std::endl;
-    
     // 世界座標をグリッド座標に変換
     auto start_grid = world_to_grid(start_pos);
     auto goal_grid = world_to_grid(goal_pos);
@@ -723,27 +670,19 @@ std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_obstacles(
         }
     }
     
-    std::cout << "Using temporary inflated grid for obstacle avoidance" << std::endl;
-    
     // 開始位置とゴール位置が有効かチェック
     if (temp_inflated_grid[start_grid.second][start_grid.first] >= OCCUPIED_THRESHOLD) {
-        std::cout << "ERROR: Start position is occupied in temporary grid!" << std::endl;
-        std::cout << "Start grid: (" << start_grid.first << ", " << start_grid.second 
-                  << "), value: " << temp_inflated_grid[start_grid.second][start_grid.first] << std::endl;
+        return std::nullopt;
     }
     
     if (temp_inflated_grid[goal_grid.second][goal_grid.first] >= OCCUPIED_THRESHOLD) {
-        std::cout << "ERROR: Goal position is occupied in temporary grid!" << std::endl;
-        std::cout << "Goal grid: (" << goal_grid.first << ", " << goal_grid.second 
-                  << "), value: " << temp_inflated_grid[goal_grid.second][goal_grid.first] << std::endl;
+        return std::nullopt;
     }
     
     // 動的制約でA*を実行
     auto result = plan_path_with_clearance(start_grid, goal_grid, wall_clearance_distance_, temp_inflated_grid);
     
     if (!result.has_value()) {
-        std::cout << "A* failed with temporary grid. Attempting fallback with reduced clearance..." << std::endl;
-        
         // フォールバック：狭い通路モードで再試行
         if (enable_narrow_passage_mode_) {
             // 縮小された膨張でもう一度試す
@@ -782,7 +721,6 @@ std::optional<Path> AStarPathPlanner::plan_path_with_dynamic_obstacles(
                 }
             }
             
-            std::cout << "Trying fallback with reduced clearance: " << min_passage_width_ << "m" << std::endl;
             result = plan_path_with_clearance(start_grid, goal_grid, min_passage_width_, reduced_inflated_grid);
         }
     }
@@ -808,8 +746,6 @@ std::vector<std::vector<int>> AStarPathPlanner::create_temporary_grid_with_obsta
         int radius_cells = std::min(static_cast<int>(std::ceil(obs_radius / resolution_)) + 2, 
                                    std::min(width_, height_) / 4);  // マップの1/4以下に制限
         
-        std::cout << "Processing obstacle at grid (" << obstacle_grid.first << ", " << obstacle_grid.second 
-                  << "), world_radius=" << obs_radius << "m, radius_cells=" << radius_cells << std::endl;
         
         // 障害物周囲のセルを占有状態に設定（四角形として処理）
         for (int dy = -radius_cells; dy <= radius_cells; ++dy) {
@@ -827,12 +763,58 @@ std::vector<std::vector<int>> AStarPathPlanner::create_temporary_grid_with_obsta
             }
         }
         
-        std::cout << "Added obstacle at (" << obs_pos.x << ", " << obs_pos.y 
-                  << ") with radius " << obs_radius << ", affected " 
-                  << (2 * radius_cells + 1) * (2 * radius_cells + 1) << " grid cells" << std::endl;
     }
     
     return temp_grid;
+}
+
+void AStarPathPlanner::compute_distance_field() {
+    distance_field_.resize(height_, std::vector<double>(width_, std::numeric_limits<double>::max()));
+    
+    // BFS based distance transform for efficiency
+    std::queue<std::pair<int, int>> queue;
+    
+    // Initialize obstacles with distance 0
+    for (int y = 0; y < height_; ++y) {
+        for (int x = 0; x < width_; ++x) {
+            if (grid_[y][x] >= OCCUPIED_THRESHOLD || grid_[y][x] == -1) {
+                distance_field_[y][x] = 0.0;
+                queue.push({x, y});
+            }
+        }
+    }
+    
+    // 8-directional offsets
+    static const std::vector<std::pair<int, int>> directions = {
+        {-1, -1}, {-1, 0}, {-1, 1},
+        {0, -1},           {0, 1},
+        {1, -1},  {1, 0},  {1, 1}
+    };
+    
+    static const std::vector<double> distances = {
+        std::sqrt(2.0), 1.0, std::sqrt(2.0),
+        1.0,                  1.0,
+        std::sqrt(2.0), 1.0, std::sqrt(2.0)
+    };
+    
+    // BFS to compute distances
+    while (!queue.empty()) {
+        auto [x, y] = queue.front();
+        queue.pop();
+        
+        for (size_t i = 0; i < directions.size(); ++i) {
+            int nx = x + directions[i].first;
+            int ny = y + directions[i].second;
+            
+            if (nx >= 0 && nx < width_ && ny >= 0 && ny < height_) {
+                double new_distance = distance_field_[y][x] + distances[i];
+                if (new_distance < distance_field_[ny][nx]) {
+                    distance_field_[ny][nx] = new_distance;
+                    queue.push({nx, ny});
+                }
+            }
+        }
+    }
 }
 
 } // namespace tvvf_vo_c

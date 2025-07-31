@@ -113,6 +113,7 @@ private:
     std::vector<std::vector<int>> grid_;
     std::vector<std::vector<int>> inflated_grid_;
     std::vector<std::vector<int>> custom_inflated_grid_;  // カスタム膨張マップ
+    std::vector<std::vector<double>> distance_field_;     // 距離場（障害物からの最短距離）
     
     // 占有閾値
     static constexpr int OCCUPIED_THRESHOLD = 65;
@@ -226,6 +227,10 @@ private:
      */
     bool has_line_of_sight(const Position& start, const Position& end) const;
 
+    /**
+     * @brief 距離場を事前計算（BFSベース）
+     */
+    void compute_distance_field();
 
     /**
      * @brief ペアのハッシュ関数

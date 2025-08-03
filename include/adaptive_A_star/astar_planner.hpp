@@ -82,6 +82,12 @@ public:
     bool is_valid_position(const std::pair<int, int>& grid_pos, 
                           const std::vector<std::vector<int>>& inflated_grid) const;
 
+    /**
+     * @brief 膨張マップを取得
+     * @return 膨張マップの参照
+     */
+    const std::vector<std::vector<int>>& get_inflated_grid() const;
+
 
     /**
      * @brief 8近傍の有効な隣接セルを取得
